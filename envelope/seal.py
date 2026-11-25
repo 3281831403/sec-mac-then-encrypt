@@ -16,12 +16,51 @@ invalid envelope，不得暴露失败原因。
 明文、密文与附加数据都是 bytes。所有比较容差为 0。
 """
 
+import hashlib
+import hmac
+
 VERSION = 1
 BLOCK_SIZE = 16
 TAG_SIZE = 32
 HEADER_SIZE = 9
 COUNTER_MAX = (1 << 64) - 1
 INVALID_MESSAGE = "invalid envelope"
+
+
+def _fail() -> ValueError:
+    return ValueError(INVALID_MESSAGE)
+
+
+def _require_bytes(value, name: str, allow_empty: bool) -> bytes:
+    if not isinstance(value, bytes):
+        raise _fail()
+    if not allow_empty and not value:
+        raise _fail()
+    return value
+
+
+def _require_int(value, name: str, low: int, high: int) -> int:
+    # bool 是 int 的子类，但不是一个合法的版本号、计数器或长度。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _fail()
+    if value < low or value > high:
+        raise _fail()
+    return value
+
+
+def _require_key(key) -> dict:
+    if not isinstance(key, dict):
+        raise _fail()
+    try:
+        enc = key["enc"]
+        mac = key["mac"]
+    except (KeyError, TypeError):
+        raise _fail() from None
+    if not isinstance(enc, bytes) or len(enc) != 32:
+        raise _fail()
+    if not isinstance(mac, bytes) or len(mac) != 32:
+        raise _fail()
+    return key
 
 
 def derive_keys(master: bytes, context: bytes) -> dict:
@@ -35,7 +74,12 @@ def derive_keys(master: bytes, context: bytes) -> dict:
       mac 等于 HMAC-SHA256(master, b"MTE-MAC" 与 context 的拼接)
     - 两个键必须不同，同一 master 下不同 context 的键也必须不同。
     """
-    raise NotImplementedError
+    _require_bytes(master, "master", allow_empty=False)
+    _require_bytes(context, "context", allow_empty=False)
+
+    enc = hmac.new(master, b"MTE-ENC" + context, hashlib.sha256).digest()
+    mac = hmac.new(master, b"MTE-MAC" + context, hashlib.sha256).digest()
+    return {"enc": enc, "mac": mac}
 
 
 def build_aad(version: int, context: bytes, counter: int) -> bytes:
@@ -49,7 +93,17 @@ def build_aad(version: int, context: bytes, counter: int) -> bytes:
       长度的 4 字节大端 加 context
     - 版本与计数器都必须实际出现在结果中，改变任一值都必须改变结果。
     """
-    raise NotImplementedError
+    _require_int(version, "version", 1, 255)
+    _require_bytes(context, "context", allow_empty=False)
+    _require_int(counter, "counter", 1, COUNTER_MAX)
+
+    return (
+        b"MTE-AAD"
+        + bytes([version])
+        + counter.to_bytes(8, "big")
+        + len(context).to_bytes(4, "big")
+        + context
+    )
 
 
 def xor_stream(key: bytes, counter: int, length: int) -> bytes:
@@ -65,7 +119,24 @@ def xor_stream(key: bytes, counter: int, length: int) -> bytes:
     - 返回按块拼接后的前 length 字节；相同输入必须得到相同结果，不同计数器
       的前 16 字节必须不同。
     """
-    raise NotImplementedError
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise _fail()
+    _require_int(counter, "counter", 1, COUNTER_MAX)
+    _require_int(length, "length", 0, (1 << 63) - 1)
+
+    blocks = []
+    produced = 0
+    index = 0
+    while produced < length:
+        block = hmac.new(
+            key,
+            b"MTE-STREAM" + counter.to_bytes(8, "big") + index.to_bytes(8, "big"),
+            hashlib.sha256,
+        ).digest()
+        blocks.append(block)
+        produced += len(block)
+        index += 1
+    return b"".join(blocks)[:length]
 
 
 def pad(data: bytes, block: int) -> bytes:
@@ -77,7 +148,11 @@ def pad(data: bytes, block: int) -> bytes:
       每字节的值都等于填充字节数，因此整块对齐时也要追加一个完整块。
     - 空 data 合法，返回恰好一个 block 的填充。
     """
-    raise NotImplementedError
+    _require_bytes(data, "data", allow_empty=True)
+    _require_int(block, "block", 2, 255)
+
+    amount = block - len(data) % block
+    return data + bytes([amount]) * amount
 
 
 def unpad(data: bytes, block: int) -> bytes:
@@ -92,7 +167,17 @@ def unpad(data: bytes, block: int) -> bytes:
       填充错误细节。
     - 校验通过后返回去掉末尾 n 字节的前缀。
     """
-    raise NotImplementedError
+    _require_bytes(data, "data", allow_empty=False)
+    _require_int(block, "block", 2, 255)
+    if len(data) % block != 0:
+        raise _fail()
+
+    amount = data[-1]
+    if amount < 1 or amount > block or amount > len(data):
+        raise _fail()
+    if data[-amount:] != bytes([amount]) * amount:
+        raise _fail()
+    return data[:-amount]
 
 
 def seal(key: dict, plaintext: bytes, aad: bytes) -> bytes:
@@ -111,7 +196,31 @@ def seal(key: dict, plaintext: bytes, aad: bytes) -> bytes:
       而漏掉头部。
     - 返回头部加密文加 32 字节标签。相同输入必须得到完全相同的令牌。
     """
-    raise NotImplementedError
+    _require_key(key)
+    _require_bytes(plaintext, "plaintext", allow_empty=True)
+    _require_bytes(aad, "aad", allow_empty=False)
+
+    mac = key["mac"]
+    enc = key["enc"]
+
+    seed = hmac.new(
+        mac,
+        b"MTE-CTR" + len(aad).to_bytes(4, "big") + aad + plaintext,
+        hashlib.sha256,
+    ).digest()
+    counter = 1 + int.from_bytes(seed[:8], "big") % COUNTER_MAX
+
+    header = bytes([VERSION]) + counter.to_bytes(8, "big")
+    padded = pad(plaintext, BLOCK_SIZE)
+    stream = xor_stream(enc, counter, len(padded))
+    ciphertext = bytes(left ^ right for left, right in zip(padded, stream))
+    tag = hmac.new(
+        mac,
+        build_aad(VERSION, aad, counter) + header + ciphertext,
+        hashlib.sha256,
+    ).digest()
+
+    return header + ciphertext + tag
 
 
 def open(key: dict, token: bytes, aad: bytes) -> bytes:
@@ -127,7 +236,40 @@ def open(key: dict, token: bytes, aad: bytes) -> bytes:
       抛 ValueError，消息必须为 invalid envelope，不得区分失败原因。
     - 校验通过后解密并去填充，返回明文；任何情况下都不得返回未经认证的明文。
     """
-    raise NotImplementedError
+    _require_key(key)
+    _require_bytes(aad, "aad", allow_empty=False)
+    _require_bytes(token, "token", allow_empty=True)
+
+    if len(token) < HEADER_SIZE + TAG_SIZE:
+        raise _fail()
+
+    version = token[0]
+    counter = int.from_bytes(token[1:HEADER_SIZE], "big")
+    ciphertext = token[HEADER_SIZE:-TAG_SIZE]
+    tag = token[-TAG_SIZE:]
+
+    if version != VERSION:
+        raise _fail()
+    if counter < 1 or counter > COUNTER_MAX:
+        raise _fail()
+    if len(ciphertext) % BLOCK_SIZE != 0:
+        raise _fail()
+    if len(tag) != TAG_SIZE:
+        raise _fail()
+
+    expected_tag = hmac.new(
+        key["mac"],
+        build_aad(version, aad, counter) + token[:HEADER_SIZE] + ciphertext,
+        hashlib.sha256,
+    ).digest()
+
+    # 认证必须在任何解密或去填充之前完成，且必须使用常量时间比较。
+    if not hmac.compare_digest(expected_tag, tag):
+        raise _fail()
+
+    stream = xor_stream(key["enc"], counter, len(ciphertext))
+    padded = bytes(left ^ right for left, right in zip(ciphertext, stream))
+    return unpad(padded, BLOCK_SIZE)
 
 
 def envelope_batch(items, policy: dict) -> dict:
@@ -146,4 +288,37 @@ def envelope_batch(items, policy: dict) -> dict:
       与 items 等长，失败位置为 None；problems 以失败下标为键，值为
       invalid envelope。成功项不写入 problems。
     """
-    raise NotImplementedError
+    if not isinstance(policy, dict) or "master" not in policy:
+        raise _fail()
+    master = _require_bytes(policy["master"], "master", allow_empty=False)
+    if not isinstance(items, list):
+        raise _fail()
+
+    tokens = []
+    plaintexts = []
+    problems = {}
+
+    for index, item in enumerate(items):
+        try:
+            if not isinstance(item, dict):
+                raise _fail()
+            context = _require_bytes(item["context"], "context", allow_empty=False)
+            aad = _require_bytes(item["aad"], "aad", allow_empty=False)
+            plaintext = _require_bytes(
+                item["plaintext"], "plaintext", allow_empty=True
+            )
+
+            # 每条独立派生键并独立封解，绝不沿用上一条的键、计数器或状态。
+            keys = derive_keys(master, context)
+            token = seal(keys, plaintext, aad)
+            recovered = open(keys, token, aad)
+        except (ValueError, KeyError, TypeError):
+            tokens.append(None)
+            plaintexts.append(None)
+            problems[index] = INVALID_MESSAGE
+            continue
+
+        tokens.append(token)
+        plaintexts.append(recovered)
+
+    return {"tokens": tokens, "plaintexts": plaintexts, "problems": problems}
